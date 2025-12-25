@@ -23,11 +23,13 @@ use dragonfly_api::dfdaemon::v2::{
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error, Result};
 use dragonfly_client_storage::metadata;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::task::JoinSet;
+use tokio::task::{JoinSet, JoinHandle};
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, Instrument};
 
 const DEFAULT_WAIT_FOR_PIECE_FROM_DIFFERENT_PARENTS: Duration = Duration::from_millis(5);
@@ -76,13 +78,16 @@ pub struct PieceCollector {
     task_id: String,
 
     /// parents is the parent peers.
-    parents: Vec<CollectedParent>,
+    parent: CollectedParent,
 
     /// interested_pieces is the pieces interested by the collector.
     interested_pieces: Vec<metadata::Piece>,
+    
+    /// cancellation token for shutdown.
+    cancel: CancellationToken,
 
-    /// collected_pieces is a map to store the collected pieces from different parents.
-    collected_pieces: Arc<DashMap<u32, Vec<CollectedParent>>>,
+    /// background task handle.
+    handle: Option<JoinHandle<()>>,
 }
 
 /// PieceCollector is used to collect pieces from peers.
@@ -93,215 +98,180 @@ impl PieceCollector {
         host_id: &str,
         task_id: &str,
         interested_pieces: Vec<metadata::Piece>,
-        parents: Vec<CollectedParent>,
+        parent: CollectedParent,
     ) -> Self {
-        let collected_pieces = Arc::new(DashMap::with_capacity(interested_pieces.len()));
-        for interested_piece in &interested_pieces {
-            collected_pieces.insert(interested_piece.number, Vec::new());
-        }
-
         Self {
             config,
             task_id: task_id.to_string(),
             host_id: host_id.to_string(),
-            parents,
+            parent,
             interested_pieces,
-            collected_pieces,
+            cancel: CancellationToken::new(),
+            handle: None,
         }
     }
 
     /// run runs the piece collector.
     #[instrument(skip_all)]
-    pub async fn run(&self) -> Receiver<CollectedPiece> {
+    pub async fn run(&mut self) -> Receiver<CollectedPiece> {
         let config = self.config.clone();
         let host_id = self.host_id.clone();
         let task_id = self.task_id.clone();
-        let parents = self.parents.clone();
+        let parent = self.parent.clone();
         let interested_pieces = self.interested_pieces.clone();
-        let collected_pieces = self.collected_pieces.clone();
+        let remaining: HashSet<u32> = interested_pieces.iter().map(|p| p.number).collect();
+
         let collected_piece_timeout = self.config.download.collected_piece_timeout;
+        let cancel = self.cancel.clone();
         let (collected_piece_tx, collected_piece_rx) = mpsc::channel(1024);
-        tokio::spawn(
+        let handle = tokio::spawn(
             async move {
-                Self::collect_from_parents(
+                if let Err(err) = Self::collect_from_parent(
                     config,
                     &host_id,
                     &task_id,
-                    parents,
+                    parent,
                     interested_pieces,
-                    collected_pieces,
+                    remaining,
                     collected_piece_tx,
                     collected_piece_timeout,
+                    cancel,
                 )
                 .await
-                .unwrap_or_else(|err| {
+                {
                     error!("collect pieces failed: {}", err);
-                });
+                }
             }
             .in_current_span(),
         );
-
+        self.handle = Some(handle);
         collected_piece_rx
     }
 
-    /// collect_from_parents collects pieces from multiple parents with load balancing strategy.
+    /// shutdown stops collecting in the middle.
     ///
-    /// The collection process works in two phases:
-    /// 1. **Synchronization Phase**: Waits for a configured duration (DEFAULT_WAIT_FOR_PIECE_FROM_DIFFERENT_PARENTS)
-    ///    to collect the same piece information from different parents. This allows the collector
-    ///    to gather multiple sources for each piece.
-    ///
-    /// 2. **Selection Phase**: After the wait period, randomly selects one parent from the available
-    ///    candidates for each piece and forwards it to the piece downloader.
-    ///
-    /// **Load Balancing Strategy**:
-    /// The random parent selection is designed to distribute download load across multiple parents
-    /// during concurrent piece downloads. This approach ensures:
-    /// - Optimal utilization of bandwidth from multiple parent nodes
-    /// - Prevention of overwhelming any single parent with too many requests
-    /// - Better overall download performance through parallel connections
-    ///
-    /// This strategy is particularly effective when downloading multiple pieces simultaneously,
-    /// as it naturally spreads the workload across the available parent pool.
+    /// After shutdown, the background task will exit soon, and sender will be dropped,
+    /// then receiver will naturally close.
+    #[instrument(skip_all)]
+    pub async fn shutdown(&mut self) {
+        self.cancel.cancel();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+
+    /// collect_from_parent collects pieces from one parent.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all)]
-    async fn collect_from_parents(
+    async fn collect_from_parent(
         config: Arc<Config>,
         host_id: &str,
         task_id: &str,
-        parents: Vec<CollectedParent>,
+        mut parent: CollectedParent,
         interested_pieces: Vec<metadata::Piece>,
-        collected_pieces: Arc<DashMap<u32, Vec<CollectedParent>>>,
+        mut remaining: HashSet<u32>,
         collected_piece_tx: Sender<CollectedPiece>,
         collected_piece_timeout: Duration,
+        cancel: CancellationToken,
     ) -> Result<()> {
-        // Create a task to collect pieces from peers.
-        let mut join_set = JoinSet::new();
-        for parent in parents.iter() {
-            #[allow(clippy::too_many_arguments)]
-            async fn sync_pieces(
-                config: Arc<Config>,
-                host_id: String,
-                task_id: String,
-                mut parent: CollectedParent,
-                interested_pieces: Vec<metadata::Piece>,
-                collected_pieces: Arc<DashMap<u32, Vec<CollectedParent>>>,
-                collected_piece_tx: Sender<CollectedPiece>,
-                collected_piece_timeout: Duration,
-            ) -> Result<CollectedParent> {
-                debug!("sync pieces from parent {}", parent.id);
+        debug!("sync pieces from parent {}", parent.id);
 
-                // If candidate_parent.host is None, skip it.
-                let host = parent.host.clone().ok_or_else(|| {
-                    error!("peer {:?} host is empty", parent);
-                    Error::InvalidPeer(parent.id.clone())
-                })?;
+        // If candidate_parent.host is None, skip it.
+        let host = parent.host.clone().ok_or_else(|| {
+            error!("peer {:?} host is empty", parent);
+            Error::InvalidPeer(parent.id.clone())
+        })?;
 
-                // Create a dfdaemon client.
-                let dfdaemon_upload_client = DfdaemonUploadClient::new(
-                    config,
-                    format!("http://{}:{}", host.ip, host.port),
-                    false,
-                )
-                .await
-                .inspect_err(|err| {
-                    error!(
-                        "create dfdaemon upload client from parent {} failed: {}",
-                        parent.id, err
-                    );
-                })?;
-
-                let response = dfdaemon_upload_client
-                    .sync_pieces(SyncPiecesRequest {
-                        host_id: host_id.to_string(),
-                        task_id: task_id.to_string(),
-                        interested_piece_numbers: interested_pieces
-                            .iter()
-                            .map(|piece| piece.number)
-                            .collect(),
-                    })
-                    .await
-                    .inspect_err(|err| {
-                        error!("sync pieces from parent {} failed: {}", parent.id, err);
-                    })?;
-
-                // If the response repeating timeout exceeds the piece download timeout, the stream will return error.
-                let out_stream = response.into_inner().timeout(collected_piece_timeout);
-                tokio::pin!(out_stream);
-
-                while let Some(message) = out_stream.try_next().await.inspect_err(|err| {
-                    error!("sync pieces from parent {} failed: {}", parent.id, err);
-                })? {
-                    let message = message?;
-
-                    if let Some(mut parents) = collected_pieces.get_mut(&message.number) {
-                        parent.download_ip = Some(message.ip);
-                        parent.download_tcp_port = message.tcp_port;
-                        parent.download_quic_port = message.quic_port;
-                        parents.push(parent.clone());
-                    } else {
-                        continue;
-                    }
-
-                    // Wait for collecting the piece from different parents when the first
-                    // piece is collected.
-                    tokio::time::sleep(DEFAULT_WAIT_FOR_PIECE_FROM_DIFFERENT_PARENTS).await;
-                    let parents = match collected_pieces.remove(&message.number) {
-                        Some((_, parents)) => parents,
-                        None => continue,
-                    };
-
-                    debug!(
-                        "receive piece {}-{} metadata from parents {:?}",
-                        task_id,
-                        message.number,
-                        parents.iter().map(|p| &p.id).collect::<Vec<&String>>()
-                    );
-
-                    collected_piece_tx
-                        .send(CollectedPiece {
-                            number: message.number,
-                            length: message.length,
-                            parents,
-                        })
-                        .await
-                        .inspect_err(|err| {
-                            error!("send CollectedPiece failed: {}", err);
-                        })?;
-                }
-
-                Ok(parent)
-            }
-
-            join_set.spawn(
-                sync_pieces(
-                    config.clone(),
-                    host_id.to_string(),
-                    task_id.to_string(),
-                    parent.clone(),
-                    interested_pieces.clone(),
-                    collected_pieces.clone(),
-                    collected_piece_tx.clone(),
-                    collected_piece_timeout,
-                )
-                .in_current_span(),
+        // Create a dfdaemon client.
+        let dfdaemon_upload_client = DfdaemonUploadClient::new(
+            config,
+            format!("http://{}:{}", host.ip, host.port),
+            false,
+        )
+        .await
+        .inspect_err(|err| {
+            error!(
+                "create dfdaemon upload client from parent {} failed: {}",
+                parent.id, err
             );
-        }
+        })?;
 
-        // Wait for all tasks to finish.
-        while let Some(message) = join_set.join_next().await {
-            match message {
-                Ok(Ok(peer)) => {
-                    debug!("peer {} sync pieces finished", peer.id);
+        let response = dfdaemon_upload_client
+            .sync_pieces(SyncPiecesRequest {
+                host_id: host_id.to_string(),
+                task_id: task_id.to_string(),
+                interested_piece_numbers: interested_pieces
+                    .iter()
+                    .map(|piece| piece.number)
+                    .collect(),
+            })
+            .await
+            .inspect_err(|err| {
+                error!("sync pieces from parent {} failed: {}", parent.id, err);
+            })?;
 
-                    // If all pieces are collected, abort all tasks.
-                    if collected_pieces.is_empty() {
-                        info!("all pieces are collected, abort all tasks");
-                        join_set.shutdown().await;
+        // If the response repeating timeout exceeds the piece download timeout, the stream will return error.
+        let out_stream = response.into_inner().timeout(collected_piece_timeout);
+        tokio::pin!(out_stream);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("piece collector cancelled for task {}", task_id);
+                    break;
+                }
+                maybe_item = out_stream.next() => {
+                    match maybe_item {
+                        None => {
+                            // Stream ended naturally. Remaining pieces (if any) are not collected.
+                            info!(
+                                "parent {} piece stream ended (task {}), remaining pieces: {}",
+                                parent.id,
+                                task_id,
+                                remaining.len()
+                            );
+                            break;
+                        }
+                        Some(item) => {
+                            let message = item
+                                .inspect_err(|err| {
+                                    error!("sync pieces from parent {} failed: {}", parent.id, err);
+                                })??;
+
+                            let number = message.number;
+
+                            // Ignore duplicates or uninterested pieces.
+                            // Only forward the first time we see a target piece.
+                            if !remaining.remove(&number) {
+                                continue;
+                            }
+
+                            // Update download endpoints from message.
+                            parent.download_ip = Some(message.ip);
+                            parent.download_tcp_port = message.tcp_port;
+                            parent.download_quic_port = message.quic_port;
+
+                            debug!(
+                                "receive piece {}-{} metadata from parent {}, remaining={}",
+                                task_id,
+                                number,
+                                parent.id,
+                                remaining.len(),
+                            );
+
+                            collected_piece_tx
+                                .send(CollectedPiece {
+                                    number,
+                                    length: message.length,
+                                    parents: vec![parent.clone()],
+                                })
+                                .await
+                                .inspect_err(|err| {
+                                    error!("send CollectedPiece failed: {}", err);
+                                })?;
+                        }
                     }
                 }
-                Ok(Err(err)) => error!("sync pieces failed: {}", err),
-                Err(err) => error!("task join error: {}", err),
             }
         }
 

@@ -1420,7 +1420,7 @@ impl PersistentTask {
         });
 
         // Initialize the piece collector.
-        let piece_collector = piece_collector::PieceCollector::new(
+        let piece_collector = piece_collector::PersistentPieceCollector::new(
             self.config.clone(),
             host_id,
             task_id,
