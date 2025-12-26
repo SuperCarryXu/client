@@ -15,6 +15,9 @@
  */
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use rand::Rng;
+use tokio::sync::Notify;
 use dragonfly_api::common::v2::{Peer};
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_storage::{metadata};
@@ -42,6 +45,8 @@ pub struct PieceSelector {
     collector_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<CollectedPiece>>>>,
     consumer_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     cancel: CancellationToken,
+    remaining_pieces: Arc<AtomicUsize>,
+    piece_notify: Arc<Notify>,
  }
 
  impl PieceSelector {
@@ -52,6 +57,7 @@ pub struct PieceSelector {
         interested_pieces: Vec<metadata::Piece>,
         parents: Vec<Peer>,
     ) -> Self {
+        let remaining = interested_pieces.len();
         Self {
             config,
             host_id: host_id.to_string(),
@@ -66,6 +72,8 @@ pub struct PieceSelector {
             collector_tx: Arc::new(Mutex::new(None)),
             consumer_handle: Arc::new(Mutex::new(None)),
             cancel: CancellationToken::new(),
+            remaining_pieces: Arc::new(AtomicUsize::new(remaining)),
+            piece_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -299,6 +307,7 @@ pub struct PieceSelector {
         // Upsert + merge under DashMap entry lock (atomic per-key within a shard).
         if target_is_children {
             Self::upsert_and_merge_entry(&self.collected_pieces_children, piece);
+            self.piece_notify.notify_one();
         } else {
             Self::upsert_and_merge_entry(&self.collected_pieces_parents, piece);
         }
@@ -401,11 +410,56 @@ pub struct PieceSelector {
             self.collected_pieces_children.remove(&k);
         }
     }
-
+    
+    /// Selects one piece randomly from collected_pieces_children.
+    ///
+    /// Behavior:
+    /// - If remaining_pieces == 0, returns None immediately.
+    /// - If no child piece is available, waits until insert_piece() notifies.
+    /// - On success, removes the piece from collected_pieces_children and decrements remaining_pieces by 1.
     pub async fn select_piece(&self) -> Option<CollectedPiece> {
-        None
+        loop {
+            // If nothing remains to be selected, return immediately.
+            if self.remaining_pieces.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+
+            // Try select once.
+            if let Some(piece) = self.try_select_from_children_once() {
+                // Decrement remaining pieces (saturating).
+                let prev = self.remaining_pieces.fetch_sub(1, Ordering::AcqRel);
+                if prev == 0 {
+                    self.remaining_pieces.store(0, Ordering::Release);
+                }
+                return Some(piece);
+            }
+
+            // Nothing available; wait for a notification.
+            // This can wake spuriously; we will re-check in the loop.
+            self.piece_notify.notified().await;
+        }
     }
 
+    /// Attempts to select one random piece from collected_pieces_children once.
+    /// Returns None if map is empty or if a race removes the chosen entry.
+    fn try_select_from_children_once(&self) -> Option<CollectedPiece> {
+        // Snapshot keys to allow random selection.
+        let keys: Vec<u32> = self
+            .collected_pieces_children
+            .iter()
+            .map(|e| *e.key())
+            .collect();
+
+        if keys.is_empty() {
+            return None;
+        }
+
+        let idx = rand::thread_rng().gen_range(0..keys.len());
+        let number = keys[idx];
+
+        // Remove and return the selected piece.
+        self.collected_pieces_children.remove(&number).map(|(_, v)| v)
+    }
  }
 
 
