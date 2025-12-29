@@ -1009,8 +1009,14 @@ impl Task {
             interested_pieces.clone(),
             parents
         ).await);
-        piece_selector.clone().run().await;
-
+    
+        piece_selector.clone()
+            .run()
+            .await
+            .inspect_err(|err| {
+                error!("start piece selector error: {:?}", err);
+            })?;
+            
         // Initialize the interrupt. If download from parent failed with scheduler or download
         // progress, interrupt the collector and return the finished pieces.
         let interrupt = Arc::new(AtomicBool::new(false));

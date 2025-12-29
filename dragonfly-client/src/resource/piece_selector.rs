@@ -16,40 +16,64 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use rand::Rng;
-use tokio::sync::Notify;
-use dragonfly_api::common::v2::{Peer};
-use dragonfly_client_config::dfdaemon::Config;
-use dragonfly_client_storage::{metadata};
-use dashmap::DashMap;
+
+use dragonfly_client_core::{Result};
 use dashmap::mapref::entry::Entry;
-use tokio::sync::{mpsc, Mutex};
+use dashmap::{DashMap, DashSet};
+use dragonfly_api::common::v2::Peer;
+use dragonfly_client_config::dfdaemon::Config;
+use dragonfly_client_storage::metadata;
+use rand::Rng;
+use tokio::sync::{mpsc, Notify, OnceCell};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use anyhow::{anyhow, Result};
-use crate::resource::piece_collector::{CollectedPiece, CollectedParent, PieceCollector};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
+use crate::resource::piece_collector::{CollectedPiece, CollectedParent, PieceCollector};
+
+/// PieceSelector maintains two independent pipelines:
+/// - Parent pipeline: initialized once in run(), only inserts into parent collected map.
+/// - Child pipeline: initialized once in run() (pipeline only), supports dynamic add/remove child collectors.
+///
+/// Selection is performed ONLY from parent collected pieces.
 pub struct PieceSelector {
     config: Arc<Config>,
     host_id: String,
-    task_id: String,    
+    task_id: String,
     interested_pieces: Vec<metadata::Piece>,
+
+    // Fixed parent set (collectors started once in run()).
     parents: Vec<Peer>,
+
+    // Dynamic child set (collectors may be added/removed after run()).
     children: Arc<DashMap<String, Peer>>,
-    piece_collectors: Arc<DashMap<String, PieceCollector>>,
+
+    // Separate collector registries to avoid id collisions and keep semantics clear.
+    parent_collectors: Arc<DashMap<String, PieceCollector>>,
+    child_collectors: Arc<DashMap<String, PieceCollector>>,
+
+    // Separate collected maps.
     collected_pieces_parents: Arc<DashMap<u32, CollectedPiece>>,
     collected_pieces_children: Arc<DashMap<u32, CollectedPiece>>,
 
-    is_piece_selected: Arc<DashMap<u32, bool>>,
-    collector_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<CollectedPiece>>>>,
-    consumer_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
-    cancel: CancellationToken,
+    // Selection bookkeeping (select only from parents).
     remaining_pieces: Arc<AtomicUsize>,
-    piece_notify: Arc<Notify>,
- }
+    parent_piece_notify: Arc<Notify>,
+    selected_pieces: Arc<DashSet<u32>>,
 
- impl PieceSelector {
+    // Parent pipeline: created once in run().
+    parent_tx: OnceCell<mpsc::Sender<CollectedPiece>>,
+    parent_consumer_handle: OnceCell<JoinHandle<()>>,
+
+    // Child pipeline: created once in run(), collectors are dynamic.
+    child_tx: OnceCell<mpsc::Sender<CollectedPiece>>,
+    child_consumer_handle: OnceCell<JoinHandle<()>>,
+
+    // Global cancellation for both pipelines.
+    cancel: CancellationToken,
+}
+
+impl PieceSelector {
     pub async fn new(
         config: Arc<Config>,
         host_id: &str,
@@ -65,107 +89,149 @@ pub struct PieceSelector {
             interested_pieces,
             parents,
             children: Arc::new(DashMap::new()),
-            piece_collectors: Arc::new(DashMap::new()),
+
+            parent_collectors: Arc::new(DashMap::new()),
+            child_collectors: Arc::new(DashMap::new()),
+
             collected_pieces_parents: Arc::new(DashMap::new()),
             collected_pieces_children: Arc::new(DashMap::new()),
-            is_piece_selected: Arc::new(DashMap::new()),
-            collector_tx: Arc::new(Mutex::new(None)),
-            consumer_handle: Arc::new(Mutex::new(None)),
-            cancel: CancellationToken::new(),
+
             remaining_pieces: Arc::new(AtomicUsize::new(remaining)),
-            piece_notify: Arc::new(Notify::new()),
+            parent_piece_notify: Arc::new(Notify::new()),
+            selected_pieces: Arc::new(DashSet::new()),
+
+            parent_tx: OnceCell::new(),
+            parent_consumer_handle: OnceCell::new(),
+            child_tx: OnceCell::new(),
+            child_consumer_handle: OnceCell::new(),
+
+            cancel: CancellationToken::new(),
         }
     }
 
-    /// run initializes the selector once and starts parent collectors.
+    /// run initializes both pipelines once and starts all parent collectors.
     ///
     /// Notes:
-    /// - This method is idempotent: calling it multiple times will not spawn
-    ///   duplicate consumer tasks or recreate the central channel.
-    /// - The central sender is stored in `collector_tx` so that new collectors
-    ///   can be added after `run()` starts.
-    pub async fn run(self: Arc<Self>) {
-        self.ensure_consumer_started().await;
+    /// - Parent collectors are started only here.
+    /// - Child pipeline is started here, but child collectors can be added/removed later.
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        self.start_parent_pipeline().await?;
+        self.start_child_pipeline().await?;
 
-        // Start collectors for initial parents.
+        // Start parent collectors once.
         for peer in self.parents.iter().cloned() {
-            if let Err(err) = self.start_collector(peer).await {
-                error!("add parent collector failed: {}", err);
-            }
+            self.start_parent_collector(peer)
+                .await
+                .inspect_err(|e| {
+                    error!("failed to start parent collector: {}", e)
+                })?;
         }
+
+        Ok(())
     }
 
-    /// ensure_consumer_started initializes the central channel and spawns the consumer task once.
-    async fn ensure_consumer_started(self: &Arc<Self>) {
-        // Fast path: if already started, do nothing.
-        {
-            let guard = self.consumer_handle.lock().await;
-            if guard.is_some() {
-                return;
-            }
-        }
-
-        // Create the central channel and store the sender.
+    /// start_parent_pipeline creates the parent channel and a consumer task that inserts into parent map.
+    async fn start_parent_pipeline(self: &Arc<Self>) -> Result<()> {
         let (tx, mut rx) = mpsc::channel::<CollectedPiece>(1024);
-        {
-            let mut guard = self.collector_tx.lock().await;
-            *guard = Some(tx);
+
+        if self.parent_tx.set(tx).is_err() {
+            error!("parent pipeline already started, skipping");
+            return Ok(());
         }
 
-        // Spawn the background consumer which owns the receiver.
         let this = Arc::clone(self);
         let cancel = this.cancel.clone();
         let task_id = this.task_id.clone();
 
+        // check if parent consumer handle is already set
+        if self.parent_consumer_handle.get().is_some() {
+            error!("parent consumer handle already set, skipping");
+            return Ok(());
+        }
+
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => {
-                        // Selector is shutting down.
-                        break;
-                    }
+                    _ = cancel.cancelled() => break,
                     maybe_piece = rx.recv() => {
                         match maybe_piece {
-                            None => {
-                                // All senders have been dropped; no more pieces will arrive.
-                                break;
-                            }
+                            None => break,
                             Some(piece) => {
-                                // Insert/merge piece info into selector state.
-                                this.insert_piece(piece).await;
+                                this.insert_parent_piece(piece).await;
                             }
                         }
                     }
                 }
             }
-
-            info!("piece selector consumer exited for task {}", task_id);
+            info!("parent consumer exited for task {}", task_id);
         });
 
-        // Store consumer task handle.
-        let mut guard = self.consumer_handle.lock().await;
-        *guard = Some(handle);
+        if self.parent_consumer_handle.set(handle).is_err() {
+            error!("parent consumer handle already set, skipping");
+            return Ok(());
+        }
+        
+        info!("parent pipeline started");
+        Ok(())
     }
 
-    /// add_parent_collector creates a collector for the given peer and attaches it to the central channel.
-    ///
-    /// Stability notes:
-    /// - If the collector stream ends, the forwarder task ends naturally.
-    /// - If the selector is shutting down (central sender dropped), sending fails and forwarder exits.
-    pub async fn start_collector(self: &Arc<Self>, peer: Peer) -> Result<()> {
-        // Get the central sender.
-        let tx = {
-            let guard = self.collector_tx.lock().await;
-            guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| anyhow!("central sender is None"))?
+    /// start_child_pipeline creates the child channel and a consumer task that inserts into child map.
+    async fn start_child_pipeline(self: &Arc<Self>) -> Result<()> {
+        let (tx, mut rx) = mpsc::channel::<CollectedPiece>(1024);
+
+        if self.child_tx.set(tx).is_err() {
+            error!("child pipeline already started, skipping");
+            return Ok(());
+        }
+
+        let this = Arc::clone(self);
+        let cancel = this.cancel.clone();
+        let task_id = this.task_id.clone();
+
+        // check if child consumer handle is already set
+        if self.child_consumer_handle.get().is_some() {
+            error!("child consumer handle already set, skipping");
+            return Ok(());
+        }
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    maybe_piece = rx.recv() => {
+                        match maybe_piece {
+                            None => break,
+                            Some(piece) => {
+                                this.insert_child_piece(piece).await;
+                            }
+                        }
+                    }
+                }
+            }
+            info!("child consumer exited for task {}", task_id);
+        });
+
+        if self.child_consumer_handle.set(handle).is_err() {
+            error!("child consumer handle already set, skipping");
+            return Ok(());
+        }
+
+        info!("child pipeline started");
+        Ok(())
+    }
+
+    /// start_parent_collector starts a collector for a parent peer and forwards into parent pipeline.
+    pub async fn start_parent_collector(self: &Arc<Self>, peer: Peer) -> Result<()> {
+        let tx = match self.parent_tx.get().cloned() {
+            Some(tx) => tx,
+            None => {
+                error!("parent pipeline not started: parent_tx is None");
+                return Ok(()); // skip starting this collector
+            }
         };
 
-        let peer_id: String = peer.id.clone();
-
-        // Avoid creating duplicate collectors for the same peer id.
-        if self.piece_collectors.contains_key(&peer_id) {
+        let peer_id = peer.id.clone();
+        if self.parent_collectors.contains_key(&peer_id) {
             return Ok(());
         }
 
@@ -177,8 +243,7 @@ pub struct PieceSelector {
             download_quic_port: None,
         };
 
-        // Initialize the collector.
-        let mut piece_collector = PieceCollector::new(
+        let mut collector = PieceCollector::new(
             self.config.clone(),
             &self.host_id,
             &self.task_id,
@@ -187,155 +252,104 @@ pub struct PieceSelector {
         )
         .await;
 
-        // Run first, then move collector into DashMap.
-        let mut piece_collector_rx = piece_collector.run().await;
-        self.piece_collectors.insert(peer_id.clone(), piece_collector);
+        let mut collector_rx = collector.run().await;
+        self.parent_collectors.insert(peer_id.clone(), collector);
 
-        // Spawn a forwarder task: collector_rx -> central_tx.
         tokio::spawn(async move {
-            while let Some(piece) = piece_collector_rx.recv().await {
+            while let Some(piece) = collector_rx.recv().await {
                 if tx.send(piece).await.is_err() {
-                    // Central receiver is gone (selector stopped); exit to avoid leaks.
                     break;
                 }
             }
         });
 
+        info!("parent collector started for peer {}", peer_id);
         Ok(())
     }
 
-    /// shutdown stops the selector and all known collectors.
-    ///
-    /// Behavior:
-    /// - Cancels the consumer task.
-    /// - Drops the central sender so all forwarders observe send() failure and exit.
-    /// - Shuts down all collectors to stop upstream streams promptly.
-    pub async fn shutdown(self: &Arc<Self>) {
-        // Cancel the consumer loop.
-        self.cancel.cancel();
-
-        // Drop the central sender to allow rx to close naturally.
-        {
-            let mut guard = self.collector_tx.lock().await;
-            *guard = None;
-        }
-
-        // Stop all collectors (best effort).
-        // NOTE: DashMap iteration yields refs; we need mutable access to call shutdown.
-        // If PieceCollector::shutdown requires &mut self, we must take ownership.
-        // A practical approach is to remove them one-by-one.
-        let keys: Vec<String> = self
-            .piece_collectors
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for k in keys {
-            if let Some((_, mut collector)) = self.piece_collectors.remove(&k) {
-                collector.shutdown().await;
+    /// start_child_collector starts a collector for a child peer and forwards into child pipeline.
+    pub async fn start_child_collector(self: &Arc<Self>, peer: Peer) -> Result<()> {
+        let tx = match self.child_tx.get().cloned() {
+            Some(tx) => tx,
+            None => {
+                error!("child pipeline not started: child_tx is None");
+                return Ok(()); // skip starting this collector
             }
-        }
-
-        // Abort/join the consumer task.
-        if let Some(handle) = self.consumer_handle.lock().await.take() {
-            handle.abort();
-        }
-    }
-
-    /// shutdown_collector stops and removes a specified collector by peer id.
-    ///
-    /// Returns:
-    /// - Ok(true)  if the collector existed and was shut down,
-    /// - Ok(false) if the collector did not exist (already removed or never added).
-    pub async fn shutdown_collector(self: &Arc<Self>, peer_id: &str) -> Result<bool> {
-        // Remove the collector first to take ownership and avoid double-shutdown races.
-        let removed = self.piece_collectors.remove(peer_id);
-        let Some((_key, mut collector)) = removed else {
-            // Collector not found.
-            return Ok(false);
         };
 
-        // Stop the collector task. This will eventually close its output receiver,
-        // allowing the forwarder task (collector_rx -> central_tx) to exit naturally.
-        collector.shutdown().await;
+        let peer_id = peer.id.clone();
+        if self.child_collectors.contains_key(&peer_id) {
+            return Ok(());
+        }
 
-        Ok(true)
+        let parent = CollectedParent {
+            id: peer_id.clone(),
+            host: peer.host,
+            download_ip: None,
+            download_tcp_port: None,
+            download_quic_port: None,
+        };
+
+        let mut collector = PieceCollector::new(
+            self.config.clone(),
+            &self.host_id,
+            &self.task_id,
+            self.interested_pieces.clone(),
+            parent,
+        )
+        .await;
+
+        let mut collector_rx = collector.run().await;
+        self.child_collectors.insert(peer_id.clone(), collector);
+
+        tokio::spawn(async move {
+            while let Some(piece) = collector_rx.recv().await {
+                if tx.send(piece).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        info!("child collector started for peer {}", peer_id);
+        Ok(())
     }
-    
 
-    /// Inserts a collected piece into the proper map (parents/children) and merges parents if needed.
-    ///
-    /// Invariant:
-    /// - collected_pieces_* maps should only contain pieces that are NOT selected.
-    ///
-    /// Concurrency notes:
-    /// - Selection may happen concurrently with insertion.
-    /// - We do a post-check cleanup to ensure selected pieces are removed from maps eventually.
-    pub async fn insert_piece(&self, piece: CollectedPiece) {
+    /// insert_parent_piece upserts into parent collected map and notifies selector waiters.
+    pub async fn insert_parent_piece(&self, piece: CollectedPiece) {
         let number = piece.number;
 
-        // If the piece is already selected, do nothing.
-        if self
-            .is_piece_selected
-            .get(&number)
-            .map(|v| *v.value())
-            .unwrap_or(false)
-        {
+        // First check: if already selected, drop immediately.
+        if self.selected_pieces.contains(&number) {
             return;
         }
 
-        // If no parents are attached, nothing to classify/merge.
-        let Some(src_parent) = piece.parents.first() else {
-            return;
-        };
-        let src_id = &src_parent.id;
+        Self::upsert_and_merge_entry(&self.collected_pieces_parents, piece);
 
-        // Determine whether the source peer belongs to children or parents.
-        // Prefer children if it appears in both sets.
-        let in_children = self.children.contains_key(src_id);
-        let in_parents = self.parents.iter().any(|p| p.id == *src_id);
-
-        let target_is_children = if in_children {
-            true
-        } else if in_parents {
-            false
-        } else {
-            // If unknown, default to parents (or change to "return" if you prefer dropping it).
-            false
-        };
-
-        // Upsert + merge under DashMap entry lock (atomic per-key within a shard).
-        if target_is_children {
-            Self::upsert_and_merge_entry(&self.collected_pieces_children, piece);
-            self.piece_notify.notify_one();
-        } else {
-            Self::upsert_and_merge_entry(&self.collected_pieces_parents, piece);
-        }
-
-        // Post-check cleanup:
-        // If the piece got selected concurrently, ensure it is removed from maps.
-        if self
-            .is_piece_selected
-            .get(&number)
-            .map(|v| *v.value())
-            .unwrap_or(false)
-        {
-            self.collected_pieces_children.remove(&number);
+        // Second check: handle race where select marked it after our first check.
+        if self.selected_pieces.contains(&number) {
             self.collected_pieces_parents.remove(&number);
+            return;
         }
+        // Notify select_piece() that a parent piece may be available.
+        self.parent_piece_notify.notify_one();
     }
 
-    /// Upserts a CollectedPiece entry and merges its parents list with de-duplication.
+    /// insert_child_piece upserts into child collected map.
+    pub async fn insert_child_piece(&self, piece: CollectedPiece) {
+        Self::upsert_and_merge_entry(&self.collected_pieces_children, piece);
+    }
+
+    /// upsert_and_merge_entry upserts a CollectedPiece and merges parents (dedupe by parent id).
     fn upsert_and_merge_entry(map: &DashMap<u32, CollectedPiece>, incoming: CollectedPiece) {
         let number = incoming.number;
 
         match map.entry(number) {
             Entry::Vacant(v) => {
-                // Insert a new entry for this piece number.
+                debug!("inserting new piece {} into map", number);
                 v.insert(incoming);
             }
             Entry::Occupied(mut o) => {
-                // Merge parents with dedupe by parent id.
+                debug!("merging piece {} into existing map", number);
                 let existing = o.get_mut();
                 for p in incoming.parents {
                     if !existing.parents.iter().any(|ep| ep.id == p.id) {
@@ -346,122 +360,182 @@ pub struct PieceSelector {
         }
     }
 
-    /// Marks a piece as selected and removes it from both collected maps.
-    ///
-    /// Returns the removed entry if it existed (either from children or parents).
-    pub async fn mark_selected_and_remove_piece(&self, number: u32) -> Option<CollectedPiece> {
-        // Mark as selected first so future inserts are rejected.
-        self.is_piece_selected.insert(number, true);
-
-        // Remove from both maps to keep invariant: only non-selected pieces remain.
-        if let Some((_, v)) = self.collected_pieces_children.remove(&number) {
-            return Some(v);
-        }
-        if let Some((_, v)) = self.collected_pieces_parents.remove(&number) {
-            return Some(v);
-        }
-        None
-    }
-
-    /// Inserts a child peer and starts a collector for it if newly inserted.
+    /// insert_child registers the child peer and starts its collector.
     pub async fn insert_child(self: &Arc<Self>, child: Peer) {
-        let child_id = child.id.clone();
-        // Insert into children map. If already exists, do nothing.
-        let is_new = self.children.insert(child_id.clone(), child.clone()).is_none();
+        let id = child.id.clone();
+        let is_new = self.children.insert(id.clone(), child.clone()).is_none();
+        info!("inserted child peer {}: {}", id, is_new);
         if !is_new {
             return;
         }
 
-        // Start a collector for this child (best-effort).
-        if let Err(err) = self.start_collector(child.clone()).await {
-            error!("start child collector failed for {}: {}", child_id, err);
+        if let Err(err) = self.start_child_collector(child).await {
+            error!("start child collector failed for {}: {}", id, err);
         }
     }
 
-    /// Removes a child peer and shuts down its collector if present.
+    /// remove_child unregisters the child peer and shuts down its collector if present.
     pub async fn remove_child(self: &Arc<Self>, child: Peer) {
-        let child_id = child.id.clone();
+        let id = child.id.clone();
+        self.children.remove(&id);
+        info!("removed child peer {}", id);
 
-        // Remove from children map first.
-        self.children.remove(&child_id);
-
-        // Shut down and remove the corresponding collector (best-effort).
-        if let Err(err) = self.shutdown_collector(&child_id).await {
-            error!("shutdown child collector failed for {}: {}", child_id, err);
+        if let Some((_, mut collector)) = self.child_collectors.remove(&id) {
+            collector.shutdown().await;
         }
 
-        // Optional cleanup:
-        // Remove any collected-but-not-selected entries that only came from this child.
-        // This keeps collected_pieces_children minimal.
-        //
-        // NOTE: This is O(N) over collected_pieces_children.
+        // Cleanup pieces contributed by this child.
+        self.cleanup_child_pieces(&id);
+    }
+
+    /// Removes the given child id from collected_pieces_children.
+    /// If a piece ends up with an empty parents list, remove the entry entirely.
+    fn cleanup_child_pieces(&self, child_id: &str) {
+        // Phase 1: collect affected keys (read-only iteration).
         let keys: Vec<u32> = self
             .collected_pieces_children
             .iter()
-            .filter_map(|entry| {
-                let v = entry.value();
-                let from_child = v.parents.iter().any(|pp| pp.id == child_id);
-                if from_child { Some(*entry.key()) } else { None }
+            .filter_map(|e| {
+                if e.value().parents.iter().any(|p| p.id == child_id) {
+                    Some(*e.key())
+                } else {
+                    None
+                }
             })
             .collect();
 
-        for k in keys {
-            // If it's selected, it should be absent anyway; removing is safe.
-            self.collected_pieces_children.remove(&k);
+        // Phase 2: mutate/remove entries using get_mut/remove.
+        for number in keys {
+            if let Some(mut entry) = self.collected_pieces_children.get_mut(&number) {
+                entry.parents.retain(|p| p.id != child_id);
+
+                if entry.parents.is_empty() {
+                    // Drop the mutable guard before removing to avoid deadlock.
+                    drop(entry);
+                    self.collected_pieces_children.remove(&number);
+                }
+            }
         }
+        debug!("cleaned up child pieces for {}", child_id)
     }
-    
-    /// Selects one piece randomly from collected_pieces_children.
+
+    /// shutdown_parent_collector shuts down and removes a parent collector by id.
+    pub async fn shutdown_parent_collector(self: &Arc<Self>, peer_id: &str) -> bool {
+        let Some((_, mut collector)) = self.parent_collectors.remove(peer_id) else {
+            return false;
+        };
+        collector.shutdown().await;
+        info!("parent collector {} shut down", peer_id);
+        true
+    }
+
+    /// shutdown_child_collector shuts down and removes a child collector by id.
+    pub async fn shutdown_child_collector(self: &Arc<Self>, peer_id: &str) -> bool {
+        let Some((_, mut collector)) = self.child_collectors.remove(peer_id) else {
+            return false;
+        };
+        collector.shutdown().await;
+        info!("child collector {} shut down", peer_id);
+        true
+    }
+
+    /// select_piece selects one piece randomly from parent collected pieces only.
     ///
     /// Behavior:
     /// - If remaining_pieces == 0, returns None immediately.
-    /// - If no child piece is available, waits until insert_piece() notifies.
-    /// - On success, removes the piece from collected_pieces_children and decrements remaining_pieces by 1.
+    /// - If no parent piece is available, waits until parent insertion notifies.
+    /// - On success, removes the selected piece from parent map and decrements remaining by 1.
     pub async fn select_piece(&self) -> Option<CollectedPiece> {
         loop {
-            // If nothing remains to be selected, return immediately.
             if self.remaining_pieces.load(Ordering::Acquire) == 0 {
                 return None;
             }
+            
+            // Pick & remove one piece from parent map.
+            let Some(piece) = self.try_select_from_parents() else {
+                self.parent_piece_notify.notified().await;
+                continue;
+            };
 
-            // Try select once.
-            if let Some(piece) = self.try_select_from_children_once() {
-                // Decrement remaining pieces (saturating).
-                let prev = self.remaining_pieces.fetch_sub(1, Ordering::AcqRel);
-                if prev == 0 {
-                    self.remaining_pieces.store(0, Ordering::Release);
-                }
-                return Some(piece);
+            let number = piece.number;
+
+            // Mark selected first to block future inserts.
+            self.selected_pieces.insert(number);
+
+            // Cleanup: in case an insert raced and re-added it after we removed,
+            // remove again (idempotent).
+            self.collected_pieces_parents.remove(&number);
+
+            // Decrement remaining pieces.
+            let prev = self.remaining_pieces.fetch_sub(1, Ordering::AcqRel);
+            if prev == 0 {
+                self.remaining_pieces.store(0, Ordering::Release);
             }
 
-            // Nothing available; wait for a notification.
-            // This can wake spuriously; we will re-check in the loop.
-            self.piece_notify.notified().await;
+            return Some(piece);
         }
     }
 
-    /// Attempts to select one random piece from collected_pieces_children once.
-    /// Returns None if map is empty or if a race removes the chosen entry.
-    fn try_select_from_children_once(&self) -> Option<CollectedPiece> {
-        // Snapshot keys to allow random selection.
-        let keys: Vec<u32> = self
-            .collected_pieces_children
-            .iter()
-            .map(|e| *e.key())
-            .collect();
+    /// try_select_from_parents_once_no_alloc randomly chooses one key from the DashMap without allocating.
+    ///
+    /// Uses reservoir sampling in one pass.
+    fn try_select_from_parents(&self) -> Option<CollectedPiece> {
+        let mut chosen: Option<u32> = None;
+        let mut seen: u32 = 0;
+        let mut rng = rand::rng();
 
-        if keys.is_empty() {
-            return None;
+        for entry in self.collected_pieces_parents.iter() {
+            seen += 1;
+            if rng.random_range(0..seen) == 0 {
+                chosen = Some(*entry.key());
+            }
         }
 
-        let idx = rand::thread_rng().gen_range(0..keys.len());
-        let number = keys[idx];
-
-        // Remove and return the selected piece.
-        self.collected_pieces_children.remove(&number).map(|(_, v)| v)
+        let number = chosen?;
+        self.collected_pieces_parents.remove(&number).map(|(_, v)| v)
     }
- }
 
+    /// shutdown stops both pipelines and all collectors.
+    ///
+    /// Behavior:
+    /// - Wakes select_piece() waiters.
+    /// - Cancels both consumers.
+    /// - Shuts down all collectors.
+    pub async fn shutdown(self: &Arc<Self>) {
+        // Prevent select_piece() from blocking forever.
+        self.remaining_pieces.store(0, Ordering::Release);
+        self.parent_piece_notify.notify_waiters();
 
+        // Cancel both consumers.
+        self.cancel.cancel();
 
- 
+        // Stop all parent collectors.
+        let pkeys: Vec<String> = self.parent_collectors.iter().map(|e| e.key().clone()).collect();
+        for k in pkeys {
+            if let Some((_, mut c)) = self.parent_collectors.remove(&k) {
+                c.shutdown().await;
+            }
+        }
+
+        // Stop all child collectors.
+        let ckeys: Vec<String> = self.child_collectors.iter().map(|e| e.key().clone()).collect();
+        for k in ckeys {
+            if let Some((_, mut c)) = self.child_collectors.remove(&k) {
+                c.shutdown().await;
+            }
+        }
+
+        // Abort consumers (optional; cancellation already requested).
+        if let Some(h) = self.parent_consumer_handle.get() {
+            h.abort();
+        }
+        if let Some(h) = self.child_consumer_handle.get() {
+            h.abort();
+        }
+    }
+
+    /// remaining returns how many pieces are still expected to be selected.
+    pub fn remaining(&self) -> usize {
+        self.remaining_pieces.load(Ordering::Acquire)
+    }
+}

@@ -1,0 +1,137 @@
+############################
+# Rust builder (cross -> linux/amd64)
+############################
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/rust:1.85.0 AS builder
+
+WORKDIR /app/client
+
+# We only build linux/amd64
+ARG TARGETPLATFORM
+ENV RUST_TARGET=x86_64-unknown-linux-gnu
+
+# Cross toolchain + amd64 libs for linking (openssl, libc headers, etc.)
+RUN set -eux; \
+    if [ "${TARGETPLATFORM}" != "linux/amd64" ]; then \
+      echo "This Dockerfile only supports TARGETPLATFORM=linux/amd64, got ${TARGETPLATFORM}"; exit 1; \
+    fi; \
+    dpkg --add-architecture amd64; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates git \
+      pkg-config protobuf-compiler libprotobuf-dev:amd64\
+      clang libclang-dev \
+      make \
+      gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+      libc6-dev:amd64 linux-libc-dev:amd64 \
+      libssl-dev:amd64 \
+    ; \
+    rm -rf /var/lib/apt/lists/*; \
+    rustup target add ${RUST_TARGET}
+
+ENV PROTOC=/usr/bin/protoc \
+    PROTOC_INCLUDE=/usr/include
+    
+# Cross compile env for cargo
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
+    AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+
+# Your project files
+COPY .git ./.git
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
+
+COPY dragonfly-client/Cargo.toml ./dragonfly-client/Cargo.toml
+COPY dragonfly-client/src ./dragonfly-client/src
+
+COPY dragonfly-client-core/Cargo.toml ./dragonfly-client-core/Cargo.toml
+COPY dragonfly-client-core/src ./dragonfly-client-core/src
+
+COPY dragonfly-client-config/Cargo.toml ./dragonfly-client-config/Cargo.toml
+COPY dragonfly-client-config/src ./dragonfly-client-config/src
+COPY dragonfly-client-config/build.rs ./dragonfly-client-config/build.rs
+
+COPY dragonfly-client-storage/Cargo.toml ./dragonfly-client-storage/Cargo.toml
+COPY dragonfly-client-storage/src ./dragonfly-client-storage/src
+COPY dragonfly-client-storage/benches ./dragonfly-client-storage/benches
+
+COPY dragonfly-client-backend/Cargo.toml ./dragonfly-client-backend/Cargo.toml
+COPY dragonfly-client-backend/src ./dragonfly-client-backend/src
+
+COPY dragonfly-client-backend/examples/plugin/Cargo.toml ./dragonfly-client-backend/examples/plugin/Cargo.toml
+COPY dragonfly-client-backend/examples/plugin/src ./dragonfly-client-backend/examples/plugin/src
+
+COPY dragonfly-client-metric/Cargo.toml ./dragonfly-client-metric/Cargo.toml
+COPY dragonfly-client-metric/src ./dragonfly-client-metric/src
+
+COPY dragonfly-client-util/Cargo.toml ./dragonfly-client-util/Cargo.toml
+COPY dragonfly-client-util/src ./dragonfly-client-util/src
+
+COPY dragonfly-client-init/Cargo.toml ./dragonfly-client-init/Cargo.toml
+COPY dragonfly-client-init/src ./dragonfly-client-init/src
+
+# Build + collect outputs to /out (stable path for COPY)
+RUN set -eux; \
+    cargo build --release --verbose --target ${RUST_TARGET} --bin dfget --bin dfdaemon --bin dfcache; \
+    cargo install tokio-console --version 0.1.13 --locked --target ${RUST_TARGET} --root /tmp/tokio-console; \
+    mkdir -p /out; \
+    cp target/${RUST_TARGET}/release/dfget /out/dfget; \
+    cp target/${RUST_TARGET}/release/dfdaemon /out/dfdaemon; \
+    cp target/${RUST_TARGET}/release/dfcache /out/dfcache; \
+    cp /tmp/tokio-console/bin/tokio-console /out/tokio-console
+
+
+############################
+# Go tools (cross -> linux/amd64)
+############################
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:1.24.9-alpine3.22 AS go_tools
+
+ARG TARGETPLATFORM
+ENV GOOS=linux GOARCH=amd64 CGO_ENABLED=0
+
+ARG GRPC_HEALTH_PROBE_VERSION=v0.4.24
+ARG GRPCURL_VERSION=latest
+ARG PPROF_VERSION=latest
+
+RUN set -eux; \
+    apk add --no-cache git ca-certificates; \
+    go install github.com/grpc-ecosystem/grpc-health-probe@${GRPC_HEALTH_PROBE_VERSION}; \
+    go install github.com/fullstorydev/grpcurl/cmd/grpcurl@${GRPCURL_VERSION}; \
+    go install github.com/google/pprof@${PPROF_VERSION}; \
+    \
+    BIN_DIR="$(go env GOPATH)/bin/${GOOS}_${GOARCH}"; \
+    echo "BIN_DIR=${BIN_DIR}"; \
+    ls -al "${BIN_DIR}"; \
+    mkdir -p /out; \
+    \
+    PROBE_BIN="$(find "${BIN_DIR}" -maxdepth 1 -type f \( -name 'grpc*health*probe*' -o -name 'grpc*probe*' \) -print -quit)"; \
+    test -n "${PROBE_BIN}"; \
+    cp "${PROBE_BIN}" /out/grpc_health_probe; \
+    cp "${BIN_DIR}/grpcurl" /out/grpcurl; \
+    cp "${BIN_DIR}/pprof" /out/pprof; \
+    chmod +x /out/grpc_health_probe /out/grpcurl /out/pprof
+
+############################
+# Final runtime image (linux/amd64)
+############################
+FROM public.ecr.aws/debian/debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iperf3 iperf linux-libc-dev libc6-dev \
+    iotop sysstat bash-completion procps apache2-utils ca-certificates binutils fio curl \
+    dnsutils iputils-ping llvm graphviz lsof strace dstat net-tools bpftrace libbpf-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/dfget /usr/local/bin/dfget
+COPY --from=builder /out/dfdaemon /usr/local/bin/dfdaemon
+COPY --from=builder /out/dfcache /usr/local/bin/dfcache
+COPY --from=builder /out/tokio-console /usr/local/bin/tokio-console
+
+COPY --from=go_tools /out/grpc_health_probe /bin/grpc_health_probe
+COPY --from=go_tools /out/grpcurl /bin/grpcurl
+COPY --from=go_tools /out/pprof /bin/pprof
+
+ENTRYPOINT ["/usr/local/bin/dfdaemon"]
