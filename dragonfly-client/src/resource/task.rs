@@ -1005,9 +1005,11 @@ impl Task {
         let piece_selector = Arc::new(PieceSelector::new(
             self.config.clone(),
             host_id,
+            peer_id,
             task_id,
             interested_pieces.clone(),
-            parents
+            parents,
+            self.scheduler_client.clone(),
         ).await);
     
         piece_selector.clone()
@@ -1016,6 +1018,7 @@ impl Task {
             .inspect_err(|err| {
                 error!("start piece selector error: {:?}", err);
             })?;
+
             
         // Initialize the interrupt. If download from parent failed with scheduler or download
         // progress, interrupt the collector and return the finished pieces.
@@ -1283,6 +1286,9 @@ impl Task {
                 Err(Error::SendTimeout) => {
                     join_set.shutdown().await;
 
+                    // Shutdown the piece selector.
+                    piece_selector.shutdown().await;
+
                     // If the send timeout with scheduler or download progress, return the finished pieces.
                     // It will stop the download from the parent with scheduler
                     // and download from the source directly from middle.
@@ -1298,6 +1304,9 @@ impl Task {
                 }
             }
         }
+
+        // Shutdown the piece selector before returning.
+        piece_selector.shutdown().await;
 
         let finished_pieces = finished_pieces.lock().await.clone();
         Ok(finished_pieces)
